@@ -30,6 +30,99 @@ Hệ thống kết hợp thị giác máy tính tiên tiến (**Dual YOLOv8 + By
 
 ---
 
+## 🏗️ Kiến Trúc Hệ Thống & Thuật Toán Cốt Lõi (Architecture & Algorithms)
+
+```mermaid
+flowchart TD
+    %% Input Sources
+    subgraph INPUT["📡 Nguồn Dữ Liệu Đầu Vào"]
+        direction LR
+        IN_RTSP["Camera RTSP / CCTV Đô Thị"]
+        IN_VID["Video Ngoại Tuyến (.mp4)"]
+        IN_IMG["Ảnh Tĩnh Chụp Cảnh Báo"]
+    end
+
+    INPUT --> PREPROC["Bộ Tiền Xử Lý & Giải Mã Khung Hình (OpenCV TCP Stream)"]
+
+    %% AI Core
+    subgraph AI_CORE["🧠 Lõi Trí Tuệ Nhân Tạo (Dual YOLOv8 Engine)"]
+        direction TB
+        YOLO_SEG["Mô hình 1: YOLOv8s-seg<br/>(Phân đoạn mặt nước - 5,090 ảnh VN)"]
+        YOLO_DET["Mô hình 2: YOLOv8s + ByteTrack<br/>(Phát hiện & Bám vết phương tiện)"]
+    end
+
+    PREPROC --> YOLO_SEG
+    PREPROC --> YOLO_DET
+
+    %% Tab 1: Flood Depth
+    subgraph TAB1["🌊 Phân Hệ Đo Độ Sâu Ngập Lụt (Adaptive Hybrid Dual-Strategy)"]
+        direction TB
+        GAUGE["Mốc Thủy Chuẩn Ảo SCSG-Net<br/>(Perspective LUT 1001 điểm)"]
+        CHANGE_POINT["Thuật Toán Constrained Change-Point<br/>(Xác định ranh giới mép nước h_gauge)"]
+        AMODAL["Tái Tạo Hộp Giới Hạn Chìm Amodal BBox<br/>(QCVN 14 & 09:2015/BGTVT: h_vehicle)"]
+        ARBITER["Bộ Phân Xử Thích Ứng (Adaptive Arbiter)<br/>Tự động học chênh cao: Δh = h_vehicle - h_gauge"]
+
+        GAUGE --> CHANGE_POINT
+        CHANGE_POINT --> ARBITER
+        AMODAL --> ARBITER
+    end
+
+    %% Tab 2: Traffic Congestion
+    subgraph TAB2["🚗 Phân Hệ Đo Độ Ùn Tắc Giao Thông"]
+        direction TB
+        ROI["Vùng Quan Sát ROI Tứ Giác 4 Điểm<br/>(Biến đổi phối cảnh Homography)"]
+        PCU["Chuẩn Hóa Tải Lượng Xe Con<br/>(PCU: Xe máy=0.3, Ô tô=1.0, Xe lớn=2.0)"]
+        METRICS["Bộ Đo Động Học Giao Thông<br/>- Vận tốc trung bình V_avg (km/h)<br/>- Lưu lượng Q (xe/phút)"]
+        STATE["Cây Quyết Định 4 Trạng Thái Ùn Tắc<br/>(Thông thoáng / Đông đúc / Ùn ứ / Ùn tắc)"]
+
+        ROI --> PCU
+        PCU --> METRICS
+        METRICS --> STATE
+    end
+
+    YOLO_SEG --> CHANGE_POINT
+    YOLO_SEG --> AMODAL
+    YOLO_DET --> AMODAL
+    YOLO_DET --> ROI
+
+    %% Outputs
+    subgraph OUTPUT["📊 Đầu Ra & Báo Cáo Thời Gian Thực"]
+        direction LR
+        HUD["Telemetry HUD Trực Quan<br/>(X-Ray Mask, Waterline, Trajectory)"]
+        ALARM["Hệ Thống Cảnh Báo Sớm<br/>(4 Cấp độ ngập & Cảnh báo ùn tắc)"]
+        DB[("Cơ Sở Dữ Liệu SQLite<br/>(Lưu vết lịch sử giao thông)")]
+    end
+
+    ARBITER --> HUD
+    ARBITER --> ALARM
+    STATE --> HUD
+    STATE --> ALARM
+    STATE --> DB
+```
+
+### 📐 Nguyên Lý Thuật Toán Trọng Tâm:
+
+1. **Hiệu chuẩn Thủy chuẩn phi tuyến (Perspective LUT Calibration):**
+   * Xây dựng bảng tra cứu Look-Up Table (LUT) gồm 1,001 điểm từ chân cọc $P_{bottom}$ ($0\text{ cm}$) đến đỉnh cọc $P_{top}$ ($H_{max}\text{ cm}$).
+   * Sử dụng ánh xạ phân thức bậc nhất để mô hình hóa hiện tượng méo phối cảnh quang học camera (vật ở gần lớn, ở xa thu nhỏ):
+     $$\frac{h(r)}{H_{max}} = \frac{r}{r + (1 - r) \cdot \lambda}$$
+     *(với $\lambda$ là tham số phối cảnh suy ra từ điểm hiệu chuẩn trung gian).*
+
+2. **Thuật toán Dò điểm ngắt (Constrained Change-Point Detection):**
+   * Quét phân bố xác suất mặt nước $P_{water}(y)$ dọc theo trục cột mốc kết hợp kiểm tra độ tin cậy hai bên cánh (Flank Reliability Test) để loại trừ vật cản che khuất (người đi bộ, xe chạy ngang).
+   * Điểm thay đổi đột ngột giữa trạng thái khô ráo và ngập nước trên thân cột được xác định qua hàm tối đa hóa độ tương phản nhị phân.
+
+3. **Thuật toán Amodal Bounding Box & Bộ Phân Xử Thích Ứng (Adaptive Arbiter):**
+   * Khi phương tiện di chuyển qua vùng ngập, phần dưới xe bị nước che khuất. Thuật toán dựa trên tỷ lệ kích thước vật lý chuẩn theo QCVN 14 & 09:2015/BGTVT (chiều cao $H_0$, chiều rộng $W_0$) để tái tạo lại toàn bộ hộp bao giới hạn chìm (Amodal BBox).
+   * **Chiến lược lai (Dual-Strategy):** Khi có xe lội nước, hệ thống tự động học giá trị chênh cao địa hình mặt đường: $\Delta h = h_{vehicle} - h_{gauge}$. Khi đêm muộn hoặc đường vắng không có xe, hệ thống tự động bù trừ cao trình từ cột mốc: $h_{road} = h_{gauge} + \Delta h$.
+
+4. **Biến đổi Homography & Chuẩn hóa PCU (Traffic Congestion Analysis):**
+   * 4 điểm góc do người dùng chấm trên khung hình camera được chuyển vị sang mặt phẳng chim bay (Bird's Eye View) thông qua ma trận Homography $H_{3 \times 3}$.
+   * Quy đổi toàn bộ phương tiện hỗn hợp sang đơn vị xe con quy đổi tiêu chuẩn (**PCU - Passenger Car Unit**):
+     $$PCU_{total} = 0.3 \times N_{moto} + 1.0 \times N_{car} + 2.0 \times N_{bus/truck}$$
+
+---
+
 ## 🚀 Hai Phân Hệ Chính (Core Modules)
 
 ### 1. ⚡ Hệ Thống Đo Độ Sâu Ngập Theo Thủy Chuẩn Cột Mốc
