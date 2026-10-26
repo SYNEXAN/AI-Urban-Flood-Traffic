@@ -1,6 +1,5 @@
 # Large Model Weights (Keep locally, avoid exceeding GitHub LFS quota)
 models/aunet_flood_sota.pth
-models/vietnam_flood_yolov8s_seg.pt
 models/vietnam_flood_yolo11s_seg.pt
 models/yolo11s_vehicle.pt
 
