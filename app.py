@@ -24,25 +24,40 @@ from PIL import Image
 import gradio as gr
 from ultralytics import YOLO
 
-# Vá lỗi tương thích giữa Gradio 4.44 và Starlette 0.38+ / 1.0+ (TypeError: unhashable type: 'dict')
+# Vá lỗi tương thích giữa Gradio 4.44 và Starlette các phiên bản
 try:
-    import inspect
     import starlette.templating
     _orig_template_response = starlette.templating.Jinja2Templates.TemplateResponse
-    _sig_params = list(inspect.signature(_orig_template_response).parameters.keys())
-    if "request" in _sig_params and _sig_params.index("request") == 1:
-        def _patched_template_response(self, *args, **kwargs):
-            if len(args) >= 1 and isinstance(args[0], str):
-                name = args[0]
-                context = args[1] if len(args) > 1 and isinstance(args[1], dict) else kwargs.get("context", {})
-                request = kwargs.get("request")
-                if request is None and isinstance(context, dict):
-                    request = context.get("request")
-                other_kwargs = {k: v for k, v in kwargs.items() if k not in ("request", "name", "context")}
+    def _patched_template_response(self, *args, **kwargs):
+        if len(args) >= 1 and isinstance(args[0], str):
+            name = args[0]
+            context = args[1] if len(args) > 1 and isinstance(args[1], dict) else kwargs.get("context", {})
+            request = kwargs.get("request")
+            if request is None and isinstance(context, dict):
+                request = context.get("request")
+            other_kwargs = {k: v for k, v in kwargs.items() if k not in ("request", "name", "context")}
+            try:
                 return _orig_template_response(self, request=request, name=name, context=context, **other_kwargs)
-            return _orig_template_response(self, *args, **kwargs)
-        starlette.templating.Jinja2Templates.TemplateResponse = _patched_template_response
+            except Exception:
+                try:
+                    return _orig_template_response(self, name, context, **other_kwargs)
+                except Exception:
+                    pass
+        return _orig_template_response(self, *args, **kwargs)
+    starlette.templating.Jinja2Templates.TemplateResponse = _patched_template_response
 except Exception as _e_patch:
+    pass
+
+# Vá lỗi tương thích Pydantic v2 và gradio_client (TypeError: argument of type 'bool' is not iterable)
+try:
+    import gradio_client.utils as _gc_utils
+    _orig_js2py = _gc_utils._json_schema_to_python_type
+    def _safe_json_schema_to_python_type(schema, defs):
+        if not isinstance(schema, dict):
+            return "Any"
+        return _orig_js2py(schema, defs)
+    _gc_utils._json_schema_to_python_type = _safe_json_schema_to_python_type
+except Exception:
     pass
 
 # Hỗ trợ Hugging Face ZeroGPU (NVIDIA A10G)
@@ -264,6 +279,17 @@ LIVE_STREAM_STATE = {
     "active": False,
     "flood_conf": 0.25,
     "veh_conf": 0.35,
+}
+
+DEFAULT_FUSION_STATE = {
+    "source_type": "video",
+    "video_path": DEFAULT_GAUGE_VIDEO,
+    "cam_source": None,
+    "cam_title": "Video mặc định",
+    "total_frames": INIT_TOTAL_FRAMES,
+    "fps": INIT_FPS,
+    "current_frame_idx": 0,
+    "base_frame": extract_video_frame(DEFAULT_GAUGE_VIDEO, 0) if DEFAULT_GAUGE_VIDEO else None,
 }
 
 
@@ -1063,11 +1089,17 @@ def run_video_tab5_live(state_data, flood_conf, start_frame_slider):
                 except Exception as frame_err:
                     print(f"⚠️ Lỗi xử lý Camera Frame {seq}: {frame_err}")
                     continue
+        except GeneratorExit:
+            LIVE_STREAM_STATE["active"] = False
+            return
         finally:
             grabber.release()
-            if LIVE_STREAM_STATE["run_id"] == my_run_id:
+            if LIVE_STREAM_STATE.get("active", False) and LIVE_STREAM_STATE["run_id"] == my_run_id:
                 LIVE_STREAM_STATE["active"] = False
-                yield gr.skip(), gr.skip(), gr.skip(), "<div style='color:#22c55e;'>✅ <b>Đã ngắt luồng Camera!</b></div>"
+                try:
+                    yield gr.skip(), gr.skip(), gr.skip(), "<div style='color:#22c55e;'>✅ <b>Đã ngắt luồng Camera!</b></div>"
+                except GeneratorExit:
+                    return
         return
 
     # Trường hợp 3: Nguồn đầu vào là Video MP4
@@ -1116,6 +1148,7 @@ def run_video_tab5_live(state_data, flood_conf, start_frame_slider):
             if not LIVE_STREAM_STATE["active"] or LIVE_STREAM_STATE["run_id"] != my_run_id:
                 break
 
+            t_frame_start = time.time()
             cur_idx += 1
             if (cur_idx % step) != 0:
                 continue
@@ -1126,7 +1159,8 @@ def run_video_tab5_live(state_data, flood_conf, start_frame_slider):
                 hud_rgb, df, alarm_html, report = process_single_frame_hybrid(
                     frame, global_multi_gauge_manager, global_tab5_arbiter,
                     active_flood, None,
-                    flood_conf=cur_conf, mode="Cột mốc"
+                    flood_conf=cur_conf, mode="Cột mốc",
+                    is_streaming=True
                 )
                 if not LIVE_STREAM_STATE["active"] or LIVE_STREAM_STATE["run_id"] != my_run_id:
                     break
@@ -1136,7 +1170,12 @@ def run_video_tab5_live(state_data, flood_conf, start_frame_slider):
                     scale_ratio = 960.0 / w_f
                     hud_rgb = cv2.resize(hud_rgb, (960, int(h_f * scale_ratio)), interpolation=cv2.INTER_AREA)
 
-                if render_cnt == 1 or (render_cnt % 4) == 0:
+                # Điều tiết nhịp phát Realtime (FPS Pacing) tránh nghẽn đường truyền Ngrok
+                t_infer = time.time() - t_frame_start
+                target_delay = 1.0 / max(10.0, min(30.0, float(cap.get(cv2.CAP_PROP_FPS) or 25.0)))
+                time.sleep(max(0.012, target_delay - t_infer))
+
+                if render_cnt == 1 or (render_cnt % 3) == 0:
                     status_info = f"<div style='color:#38bdf8;'>🎬 Khung hình <b>{cur_idx}/{total_frames}</b> ({(cur_idx / max(1, total_frames))*100:.0f}%) | Mực nước: <b>{report.master_depth_cm:.1f} cm</b></div>"
                     yield hud_rgb, df, alarm_html, status_info
                 else:
@@ -1144,12 +1183,18 @@ def run_video_tab5_live(state_data, flood_conf, start_frame_slider):
             except Exception as frame_err:
                 print(f"⚠️ Cảnh báo lỗi xử lý Frame {cur_idx}: {frame_err}")
                 continue
+    except GeneratorExit:
+        LIVE_STREAM_STATE["active"] = False
+        return
     finally:
         cap.release()
 
-    if LIVE_STREAM_STATE["run_id"] == my_run_id:
+    if LIVE_STREAM_STATE.get("active", False) and LIVE_STREAM_STATE["run_id"] == my_run_id:
         LIVE_STREAM_STATE["active"] = False
-        yield gr.skip(), gr.skip(), gr.skip(), "<div style='color:#22c55e;'>✅ <b>Đã phát xong toàn bộ video!</b> Kết quả đo đạc cuối cùng đã được lưu giữ.</div>"
+        try:
+            yield gr.skip(), gr.skip(), gr.skip(), "<div style='color:#22c55e;'>✅ <b>Đã phát xong toàn bộ video!</b> Kết quả đo đạc cuối cùng đã được lưu giữ.</div>"
+        except GeneratorExit:
+            return
 
 
 # ==============================================================================
@@ -1535,11 +1580,17 @@ def run_traffic_congestion_live(state_data, veh_conf, start_frame_slider):
                 except Exception as frame_err:
                     print(f"⚠️ Lỗi xử lý Camera Giao thông Frame {seq}: {frame_err}")
                     continue
+        except GeneratorExit:
+            LIVE_STREAM_STATE["active"] = False
+            return
         finally:
             grabber.release()
-            if LIVE_STREAM_STATE["run_id"] == my_run_id:
+            if LIVE_STREAM_STATE.get("active", False) and LIVE_STREAM_STATE["run_id"] == my_run_id:
                 LIVE_STREAM_STATE["active"] = False
-                yield gr.skip(), gr.skip(), gr.skip(), "<div style='color:#22c55e;'>✅ <b>Đã ngắt luồng Camera giao thông!</b></div>"
+                try:
+                    yield gr.skip(), gr.skip(), gr.skip(), "<div style='color:#22c55e;'>✅ <b>Đã ngắt luồng Camera giao thông!</b></div>"
+                except GeneratorExit:
+                    return
         return
 
     # Trường hợp 3: Nguồn Video MP4
@@ -1590,6 +1641,7 @@ def run_traffic_congestion_live(state_data, veh_conf, start_frame_slider):
             if not LIVE_STREAM_STATE["active"] or LIVE_STREAM_STATE["run_id"] != my_run_id:
                 break
 
+            t_frame_start = time.time()
             cur_idx += 1
             if (cur_idx % step) != 0:
                 continue
@@ -1606,7 +1658,18 @@ def run_traffic_congestion_live(state_data, veh_conf, start_frame_slider):
                 if not LIVE_STREAM_STATE["active"] or LIVE_STREAM_STATE["run_id"] != my_run_id:
                     break
 
-                if render_cnt == 1 or (render_cnt % 4) == 0:
+                # Tối ưu kích thước hiển thị chống nghẽn Ngrok
+                h_f, w_f = hud_rgb.shape[:2]
+                if w_f > 960:
+                    scale_ratio = 960.0 / w_f
+                    hud_rgb = cv2.resize(hud_rgb, (960, int(h_f * scale_ratio)), interpolation=cv2.INTER_AREA)
+
+                # Điều tiết nhịp phát Realtime (FPS Pacing)
+                t_infer = time.time() - t_frame_start
+                target_delay = 1.0 / max(10.0, min(30.0, float(fps_vid)))
+                time.sleep(max(0.012, target_delay - t_infer))
+
+                if render_cnt == 1 or (render_cnt % 3) == 0:
                     status_info = f"<div style='color:#38bdf8;'>🎬 Khung hình <b>{cur_idx}/{total_frames}</b> ({(cur_idx / max(1, total_frames))*100:.0f}%) | Trạng thái: <b>{report.status_label}</b> | Số xe: <b>{report.vehicle_count}</b> | Tốc độ TB: <b>{report.avg_speed_kmh:.1f} km/h</b></div>"
                     yield hud_rgb, df, alarm_html, status_info
                 else:
@@ -1614,13 +1677,410 @@ def run_traffic_congestion_live(state_data, veh_conf, start_frame_slider):
             except Exception as frame_err:
                 print(f"⚠️ Cảnh báo lỗi xử lý Traffic Frame {cur_idx}: {frame_err}")
                 continue
+    except GeneratorExit:
+        LIVE_STREAM_STATE["active"] = False
+        return
     finally:
         cap.release()
 
-    if LIVE_STREAM_STATE["run_id"] == my_run_id:
+    if LIVE_STREAM_STATE.get("active", False) and LIVE_STREAM_STATE["run_id"] == my_run_id:
         LIVE_STREAM_STATE["active"] = False
-        yield gr.skip(), gr.skip(), gr.skip(), "<div style='color:#22c55e;'>✅ <b>Đã phát xong toàn bộ video!</b> Lịch sử ùn tắc đã được lưu vào cơ sở dữ liệu.</div>"
+        try:
+            yield gr.skip(), gr.skip(), gr.skip(), "<div style='color:#22c55e;'>✅ <b>Đã phát xong toàn bộ video!</b> Lịch sử ùn tắc đã được lưu vào cơ sở dữ liệu.</div>"
+        except GeneratorExit:
+            return
 
+
+
+# ==============================================================================
+# HỆ THỐNG TÍCH HỢP (DUAL FUSION): ĐO ĐỘ SÂU NGẬP & GIÁM SÁT ÙN TẮC (TUẦN TỰ 2 MODEL)
+# ==============================================================================
+def on_fusion_switch_to_image_tab(img_rgb, state_data):
+    stop_live_stream()
+    global_traffic_analyzer.reset()
+    if img_rgb is not None:
+        return on_fusion_image_loaded(img_rgb, state_data)
+    if state_data:
+        state_data["source_type"] = "image"
+    slider_update = gr.Slider(minimum=0, maximum=1, value=0, step=1, label="Khung hình video", interactive=False)
+    msg = "<div style='color:#38bdf8;'>🖼️ <b>Đã chuyển sang tab Ảnh Tích Hợp</b>. Tải ảnh lên và nhấn bắt đầu để chạy tuần tự 2 Model!</div>"
+    return gr.skip(), slider_update, state_data, msg
+
+def on_fusion_switch_to_video_tab(video_file, state_data):
+    stop_live_stream()
+    global_traffic_analyzer.reset()
+    if video_file is not None:
+        return on_fusion_video_loaded(video_file, state_data)
+    if state_data:
+        state_data["source_type"] = "video"
+        state_data["video_path"] = DEFAULT_GAUGE_VIDEO
+    slider_update = gr.Slider(minimum=0, maximum=100, value=0, step=1, label="Khung hình video", interactive=True)
+    msg = "<div style='color:#38bdf8;'>🎬 <b>Đã chuyển sang tab Video Tích Hợp</b>. Sẵn sàng video mặc định hoặc tải video mới!</div>"
+    return INIT_GAUGE_FRAME, slider_update, state_data, msg
+
+def on_fusion_switch_to_camera_tab(cam_url, state_data):
+    stop_live_stream()
+    global_traffic_analyzer.reset()
+    return on_fusion_camera_connect(cam_url, state_data)
+
+def on_fusion_image_loaded(img_rgb, state_data):
+    stop_live_stream()
+    global_traffic_analyzer.reset()
+    if img_rgb is None:
+        return gr.skip(), gr.skip(), state_data, "<div style='color:red;'>⚠️ Chưa có ảnh tải lên!</div>"
+    if state_data is None:
+        state_data = DEFAULT_FUSION_STATE.copy()
+    state_data["source_type"] = "image"
+    state_data["base_frame"] = img_rgb.copy()
+    slider_update = gr.Slider(minimum=0, maximum=1, value=0, step=1, label="Khung hình video", interactive=False)
+    msg = "<div style='color:#22c55e;'>✅ <b>Đã nạp ảnh thành công!</b> Nhấn <b>BẮT ĐẦU DỰ ĐOÁN AI</b> để phân tích tuần tự cả Ngập Lụt & Phương Tiện.</div>"
+    return img_rgb, slider_update, state_data, msg
+
+def on_fusion_video_loaded(video_file, state_data):
+    stop_live_stream()
+    global_traffic_analyzer.reset()
+    clean_path = get_clean_filepath(video_file)
+    if not clean_path or not Path(clean_path).exists():
+        clean_path = DEFAULT_GAUGE_VIDEO
+    if state_data is None:
+        state_data = DEFAULT_FUSION_STATE.copy()
+    state_data["source_type"] = "video"
+    state_data["video_path"] = clean_path
+
+    cap = cv2.VideoCapture(clean_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 100
+    ret, frame_bgr = cap.read()
+    cap.release()
+
+    first_frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB) if ret and frame_bgr is not None else INIT_GAUGE_FRAME
+    state_data["base_frame"] = first_frame
+    state_data["total_frames"] = total_frames
+    slider_update = gr.Slider(minimum=0, maximum=max(1, total_frames - 1), value=0, step=1, label="Khung hình video", interactive=True)
+    msg = f"<div style='color:#22c55e;'>✅ <b>Đã tải video:</b> {Path(clean_path).name} ({total_frames} frames). Sẵn sàng phân tích tích hợp tuần tự 2 Model!</div>"
+    return first_frame, slider_update, state_data, msg
+
+def on_fusion_camera_connect(cam_url, state_data):
+    stop_live_stream()
+    global_traffic_analyzer.reset()
+    if state_data is None:
+        state_data = DEFAULT_FUSION_STATE.copy()
+    cam_name = "Camera Trực Tiếp"
+    for c in CANTHO_CAMERAS:
+        if c["url"] == cam_url:
+            cam_name = f"{c['name']} ({c['short_loc']})"
+            break
+    state_data["source_type"] = "camera_stream"
+    state_data["cam_source"] = cam_url
+    state_data["cam_title"] = cam_name
+
+    cap = cv2.VideoCapture(cam_url)
+    ret, frame_bgr = cap.read()
+    cap.release()
+    first_frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB) if ret and frame_bgr is not None else INIT_GAUGE_FRAME
+    state_data["base_frame"] = first_frame
+    slider_update = gr.Slider(minimum=0, maximum=1, value=0, step=1, label="Khung hình Camera", interactive=False)
+    msg = f"<div style='color:#22c55e;'>📷 <b>Đã kết nối {cam_name}!</b> Bấm <b>BẮT ĐẦU DỰ ĐOÁN AI</b> để phân tích ngập & giao thông trực tiếp.</div>"
+    return first_frame, slider_update, state_data, msg
+
+def on_fusion_seek_frame(slider_val, state_data):
+    if not state_data or state_data.get("source_type") != "video":
+        return gr.skip(), state_data
+    vid_path = state_data.get("video_path")
+    if not vid_path:
+        return gr.skip(), state_data
+    cap = cv2.VideoCapture(vid_path)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(slider_val))
+    ret, frame_bgr = cap.read()
+    cap.release()
+    if ret and frame_bgr is not None:
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        state_data["base_frame"] = frame_rgb
+        state_data["current_frame_idx"] = int(slider_val)
+        return frame_rgb, state_data
+    return gr.skip(), state_data
+
+
+def run_fusion_live(state_data, flood_conf, veh_conf, start_frame_slider):
+    """
+    Chạy suy luận TUẦN TỰ 2 Model (Model 1: Ngập Lụt -> Model 2: Phương Tiện & Ùn Tắc)
+    trên từng khung hình của Ảnh, Video hoặc Camera Streaming.
+    """
+    LIVE_STREAM_STATE["run_id"] += 1
+    my_run_id = LIVE_STREAM_STATE["run_id"]
+    LIVE_STREAM_STATE["active"] = True
+    LIVE_STREAM_STATE["flood_conf"] = float(flood_conf) if flood_conf is not None else 0.25
+    LIVE_STREAM_STATE["veh_conf"] = float(veh_conf) if veh_conf is not None else 0.25
+    global_traffic_analyzer.reset()
+
+    active_flood = get_selected_flood_model()
+    source_type = state_data.get("source_type", "video") if state_data else "video"
+    loc_name = state_data.get("cam_title", "Camera Giám Sát Tích Hợp") if state_data else "Camera Giám Sát Tích Hợp"
+
+    def build_fusion_outputs(flood_report, traffic_report):
+        depth = getattr(flood_report, 'master_depth_cm', 0.0) if flood_report else 0.0
+        flood_alarm = getattr(flood_report, 'alarm_level', 'Bình thường') if flood_report else 'Bình thường'
+        veh_count = getattr(traffic_report, 'vehicle_count', 0) if traffic_report else 0
+        status_label = getattr(traffic_report, 'status_label', 'Bình thường') if traffic_report else 'Bình thường'
+        avg_speed = getattr(traffic_report, 'avg_speed_kmh', 0.0) if traffic_report else 0.0
+
+        if depth > 20 and ("Ùn tắc" in status_label or "Ùn ứ" in status_label):
+            alert_bg = "#dc2626"
+            alert_title = "🚨 BÁO ĐỘNG KÉP: ÙN TẮC DO NGẬP ÚNG SÂU"
+            advice = f"Mực nước <b>{depth:.1f} cm</b> ({flood_alarm}) gây cản trở dòng xe ({veh_count} xe). Nguy cơ chết máy cao, khuyến cáo không đi vào!"
+        elif depth > 20:
+            alert_bg = "#ea580c"
+            alert_title = f"⚠️ CẢNH BÁO NGẬP LỤT: {depth:.1f} cm ({flood_alarm})"
+            advice = "Phương tiện gầm thấp (xe máy, ô tô con) cần chọn lộ trình thay thế tránh đoạn ngập."
+        elif "Ùn tắc" in status_label or "Ùn ứ" in status_label:
+            alert_bg = "#d97706"
+            alert_title = f"🚗 CẢNH BÁO ÙN TẮC: {status_label} ({veh_count} xe)"
+            advice = f"Mật độ giao thông cao, vận tốc trung bình {avg_speed:.1f} km/h. Các phương tiện giữ khoảng cách an toàn."
+        else:
+            alert_bg = "#16a34a"
+            alert_title = "🟢 AN TOÀN: GIAO THÔNG THÔNG THOÁNG & MẶT ĐƯỜNG KHÔ RÁO"
+            advice = f"Mực nước: {depth:.1f} cm | Phương tiện: {veh_count} xe ({status_label}). Lưu thông bình thường."
+
+        alert_html = f"""
+        <div style="background:{alert_bg}; color:white; padding:12px 16px; border-radius:8px; margin-bottom:8px;">
+            <div style="font-size:15px; font-weight:700;">{alert_title}</div>
+            <div style="font-size:13px; opacity:0.95; margin-top:4px;">💡 <b>Khuyến nghị:</b> {advice}</div>
+        </div>
+        """
+
+        summary_df = pd.DataFrame([
+            ["Độ Sâu Ngập Nước", f"{depth:.1f} cm"],
+            ["Cấp Báo Động Ngập", f"{flood_alarm}"],
+            ["Số Lượng Phương Tiện", f"{veh_count} xe"],
+            ["Trạng Thái Giao Thông", f"{status_label}"],
+            ["Vận Tốc Trung Bình", f"{avg_speed:.1f} km/h"],
+            ["Chế Độ Thực Thi AI", "Tuần tự 2 Model (Tesla T4 GPU)"]
+        ], columns=["Chỉ Số Giám Sát", "Giá Trị"])
+
+        return summary_df, alert_html
+
+    # Trường hợp 1: Ảnh tĩnh
+    if source_type == "image":
+        base_frame = state_data.get("base_frame") if state_data else None
+        if base_frame is None:
+            LIVE_STREAM_STATE["active"] = False
+            yield gr.skip(), pd.DataFrame(), "<div style='color:red;'>⚠️ Vui lòng tải ảnh lên trước khi dự đoán!</div>", "<div style='color:red;'>⚠️ Chưa có ảnh hợp lệ</div>"
+            return
+
+        yield (
+            gr.skip(),
+            gr.skip(),
+            "<div style='background:#1e293b; color:#38bdf8; padding:10px; border-radius:8px;'>🚀 <b>Đang chạy tuần tự 2 Model AI (Ngập lụt -> Giao thông)...</b></div>",
+            "<div style='color:#38bdf8;'>🚀 <b>Đang phân tích ảnh...</b></div>"
+        )
+        cur_flood_conf = float(LIVE_STREAM_STATE.get("flood_conf", flood_conf))
+        cur_veh_conf = float(LIVE_STREAM_STATE.get("veh_conf", veh_conf))
+
+        # Model 1: Flood Seg + Thủy chuẩn
+        flood_hud_rgb, flood_df, flood_alarm_html, flood_report = process_single_frame_hybrid(
+            base_frame, global_multi_gauge_manager, global_tab5_arbiter,
+            active_flood, None,
+            flood_conf=cur_flood_conf, mode="Cột mốc"
+        )
+
+        # Chuyển qua BGR để đưa vào Model 2
+        flood_hud_bgr = cv2.cvtColor(flood_hud_rgb, cv2.COLOR_RGB2BGR)
+
+        # Model 2: Vehicle Tracking & Congestion
+        final_hud_rgb, traffic_df, traffic_alarm_html, traffic_report = global_traffic_analyzer.analyze_frame(
+            flood_hud_bgr, vehicle_model, veh_conf=cur_veh_conf, fps=1.0, is_single_image=True, location_name=loc_name
+        )
+
+        summary_df, alert_html = build_fusion_outputs(flood_report, traffic_report)
+        LIVE_STREAM_STATE["active"] = False
+        status_info = f"<div style='color:#22c55e;'>✅ <b>Phân tích tích hợp hoàn tất!</b> | Mực nước: <b>{flood_report.master_depth_cm:.1f} cm</b> | Xe: <b>{traffic_report.vehicle_count}</b> ({traffic_report.status_label})</div>"
+        yield final_hud_rgb, summary_df, alert_html, status_info
+        return
+
+    # Trường hợp 2: Camera RTSP / HTTP Stream
+    if source_type == "camera_stream":
+        cam_src = state_data.get("cam_source", 0) if state_data else 0
+        yield (
+            gr.skip(),
+            gr.skip(),
+            "<div style='background:#1e293b; color:#38bdf8; padding:10px; border-radius:8px;'>📷 <b>Đang mở luồng Camera trực tiếp tích hợp...</b></div>",
+            "<div style='color:#38bdf8;'>📷 <b>Đang kết nối luồng Camera...</b></div>"
+        )
+        grabber = LatestFrameGrabber(cam_src)
+        if not grabber.is_opened:
+            grabber.release()
+            LIVE_STREAM_STATE["active"] = False
+            yield gr.skip(), pd.DataFrame(), "<div style='color:red;'>⚠️ Không thể mở luồng Camera!</div>", "<div style='color:red;'>Lỗi kết nối Camera</div>"
+            return
+
+        last_seq = -1
+        render_cnt = 0
+        try:
+            while grabber.is_opened and LIVE_STREAM_STATE["active"] and LIVE_STREAM_STATE["run_id"] == my_run_id:
+                ok, frame, frame_ts, seq = grabber.read_latest()
+                if not ok or frame is None or seq == last_seq:
+                    time.sleep(0.008)
+                    continue
+                last_seq = seq
+                if not LIVE_STREAM_STATE["active"] or LIVE_STREAM_STATE["run_id"] != my_run_id:
+                    break
+                render_cnt += 1
+                try:
+                    cur_flood_conf = float(LIVE_STREAM_STATE.get("flood_conf", flood_conf))
+                    cur_veh_conf = float(LIVE_STREAM_STATE.get("veh_conf", veh_conf))
+
+                    # 1. Model 1: Ngập lụt
+                    flood_hud_rgb, flood_df, flood_alarm_html, flood_report = process_single_frame_hybrid(
+                        frame, global_multi_gauge_manager, global_tab5_arbiter,
+                        active_flood, None,
+                        flood_conf=cur_flood_conf, mode="Cột mốc"
+                    )
+                    if not LIVE_STREAM_STATE["active"] or LIVE_STREAM_STATE["run_id"] != my_run_id:
+                        break
+
+                    flood_hud_bgr = cv2.cvtColor(flood_hud_rgb, cv2.COLOR_RGB2BGR)
+
+                    # 2. Model 2: Phương tiện
+                    final_hud_rgb, traffic_df, traffic_alarm_html, traffic_report = global_traffic_analyzer.analyze_frame(
+                        flood_hud_bgr, vehicle_model, veh_conf=cur_veh_conf, fps=grabber.fps,
+                        is_single_image=False, location_name=loc_name, sim_time_s=frame_ts
+                    )
+                    if not LIVE_STREAM_STATE["active"] or LIVE_STREAM_STATE["run_id"] != my_run_id:
+                        break
+
+                    summary_df, alert_html = build_fusion_outputs(flood_report, traffic_report)
+
+                    if render_cnt == 1 or (render_cnt % 4) == 0:
+                        status_info = f"<div style='color:#38bdf8;'>📷 <b>Camera Live (Frame {seq})</b> | Mực nước: <b>{flood_report.master_depth_cm:.1f} cm</b> | Xe: <b>{traffic_report.vehicle_count}</b> ({traffic_report.status_label})</div>"
+                        yield final_hud_rgb, summary_df, alert_html, status_info
+                    else:
+                        yield final_hud_rgb, gr.skip(), alert_html, gr.skip()
+                except Exception as frame_err:
+                    print(f"⚠️ Lỗi xử lý Camera Fusion Frame {seq}: {frame_err}")
+                    continue
+        except GeneratorExit:
+            LIVE_STREAM_STATE["active"] = False
+            return
+        finally:
+            grabber.release()
+            if LIVE_STREAM_STATE.get("active", False) and LIVE_STREAM_STATE["run_id"] == my_run_id:
+                LIVE_STREAM_STATE["active"] = False
+                try:
+                    yield gr.skip(), gr.skip(), gr.skip(), "<div style='color:#22c55e;'>✅ <b>Đã ngắt luồng Camera tích hợp!</b></div>"
+                except GeneratorExit:
+                    return
+        return
+
+    # Trường hợp 3: Video MP4
+    yield (
+        gr.skip(),
+        gr.skip(),
+        "<div style='background:#1e293b; color:#38bdf8; padding:10px; border-radius:8px;'>🚀 <b>Đang khởi động 2 Model AI phân tích tích hợp Video...</b></div>",
+        "<div style='color:#38bdf8;'>🚀 <b>Đang phân tích video tuần tự 2 Model...</b></div>"
+    )
+
+    video_raw = state_data.get("video_path") if state_data else None
+    if not video_raw and DEFAULT_GAUGE_VIDEO:
+        video_raw = DEFAULT_GAUGE_VIDEO
+
+    video_path = get_clean_filepath(video_raw)
+    if not video_path or not Path(video_path).exists():
+        LIVE_STREAM_STATE["active"] = False
+        yield gr.skip(), pd.DataFrame(), "<div style='color:red;'>⚠️ Vui lòng tải video lên trước khi nhận diện!</div>", "<div style='color:red;'>⚠️ Chưa có video hợp lệ</div>"
+        return
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        LIVE_STREAM_STATE["active"] = False
+        yield gr.skip(), pd.DataFrame(), f"<div style='color:red;'>⚠️ Không thể mở tệp video: {Path(video_path).name}!</div>", "<div style='color:red;'>Lỗi mở video</div>"
+        return
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 100
+    fps_vid = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    if fps_vid <= 1.0 or fps_vid > 120.0:
+        fps_vid = 25.0
+    start_idx = int(start_frame_slider) if start_frame_slider is not None else 0
+
+    if start_idx >= max(1, total_frames - 15):
+        start_idx = 0
+    if start_idx > 0 and start_idx < total_frames:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_idx)
+
+    cur_idx = start_idx
+    step = 1
+    render_cnt = 0
+
+    try:
+        while cap.isOpened() and LIVE_STREAM_STATE["active"] and LIVE_STREAM_STATE["run_id"] == my_run_id:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                break
+            if not LIVE_STREAM_STATE["active"] or LIVE_STREAM_STATE["run_id"] != my_run_id:
+                break
+
+            cur_idx += 1
+            if (cur_idx % step) != 0:
+                continue
+
+            render_cnt += 1
+            video_sim_time_s = float(cur_idx) / float(fps_vid)
+            try:
+                cur_flood_conf = float(LIVE_STREAM_STATE.get("flood_conf", flood_conf))
+                cur_veh_conf = float(LIVE_STREAM_STATE.get("veh_conf", veh_conf))
+
+                # 1. Model 1: Ngập lụt & Thủy chuẩn
+                flood_hud_rgb, flood_df, flood_alarm_html, flood_report = process_single_frame_hybrid(
+                    frame, global_multi_gauge_manager, global_tab5_arbiter,
+                    active_flood, None,
+                    flood_conf=cur_flood_conf, mode="Cột mốc",
+                    is_streaming=True
+                )
+                if not LIVE_STREAM_STATE["active"] or LIVE_STREAM_STATE["run_id"] != my_run_id:
+                    break
+
+                flood_hud_bgr = cv2.cvtColor(flood_hud_rgb, cv2.COLOR_RGB2BGR)
+
+                # 2. Model 2: Phương tiện & Ùn tắc
+                final_hud_rgb, traffic_df, traffic_alarm_html, traffic_report = global_traffic_analyzer.analyze_frame(
+                    flood_hud_bgr, vehicle_model, veh_conf=cur_veh_conf, fps=fps_vid,
+                    is_single_image=False, location_name=Path(video_path).name,
+                    sim_time_s=video_sim_time_s
+                )
+                if not LIVE_STREAM_STATE["active"] or LIVE_STREAM_STATE["run_id"] != my_run_id:
+                    break
+
+                # Tối ưu kích thước hiển thị chống nghẽn Ngrok
+                h_f, w_f = final_hud_rgb.shape[:2]
+                if w_f > 960:
+                    scale_ratio = 960.0 / w_f
+                    final_hud_rgb = cv2.resize(final_hud_rgb, (960, int(h_f * scale_ratio)), interpolation=cv2.INTER_AREA)
+
+                # Điều tiết nhịp phát Realtime (FPS Pacing)
+                t_infer = time.time() - t_frame_start
+                target_delay = 1.0 / max(10.0, min(30.0, float(fps_vid)))
+                time.sleep(max(0.012, target_delay - t_infer))
+
+                summary_df, alert_html = build_fusion_outputs(flood_report, traffic_report)
+
+                if render_cnt == 1 or (render_cnt % 3) == 0:
+                    status_info = f"<div style='color:#38bdf8;'>🎬 Video ({cur_idx}/{total_frames}) | Mực nước: <b>{flood_report.master_depth_cm:.1f} cm</b> | Xe: <b>{traffic_report.vehicle_count}</b> ({traffic_report.status_label})</div>"
+                    yield final_hud_rgb, summary_df, alert_html, status_info
+                else:
+                    yield final_hud_rgb, gr.skip(), alert_html, gr.skip()
+            except Exception as frame_err:
+                print(f"⚠️ Cảnh báo lỗi xử lý Video Fusion Frame {cur_idx}: {frame_err}")
+                continue
+    except GeneratorExit:
+        LIVE_STREAM_STATE["active"] = False
+        return
+    finally:
+        cap.release()
+
+    if LIVE_STREAM_STATE.get("active", False) and LIVE_STREAM_STATE["run_id"] == my_run_id:
+        LIVE_STREAM_STATE["active"] = False
+        try:
+            yield gr.skip(), gr.skip(), gr.skip(), "<div style='color:#22c55e;'>✅ <b>Đã phát xong toàn bộ video tích hợp!</b></div>"
+        except GeneratorExit:
+            return
 
 # ==============================================================================
 # GIAO DIỆN GRADIO HIỆN ĐẠI
@@ -1876,7 +2336,82 @@ with gr.Blocks(title="AI Urban Flood & Traffic Congestion Monitor", theme=gr.the
                         )
                         btn_traffic_clear_roi = gr.Button("🗑️ Xóa Khung Làn Đường", variant="secondary", scale=1)
 
-        # ==================== SỰ KIỆN CHUNG & TAB 1 (NGẬP LỤT) ====================
+        
+        with gr.TabItem("🌊🚗 Tích Hợp: Đo Độ Sâu Ngập & Giám Sát Ùn Tắc (Dual Fusion)", id="tab_fusion") as tab_item_fusion:
+            with gr.Row():
+                # CỘT BÊN TRÁI: NGUỒN ĐẦU VÀO & BẢNG THÔNG SỐ TÍCH HỢP
+                with gr.Column(scale=2):
+                    gr.Markdown("#### 📁 1. Nguồn Đầu Vào & Điều Khiển 2 Model AI")
+                    with gr.Tabs(selected="fusion_input_video") as fusion_input_tabs:
+                        with gr.TabItem("Ảnh", id="fusion_input_image") as tab_fusion_image:
+                            fusion_upload_image = gr.Image(
+                                sources=["upload", "clipboard"],
+                                type="numpy",
+                                label="Tải ảnh",
+                                interactive=True
+                            )
+                        with gr.TabItem("Video", id="fusion_input_video") as tab_fusion_video:
+                            fusion_upload_video = gr.Video(
+                                label="Tải video",
+                                interactive=True
+                            )
+                        with gr.TabItem("Camera", id="fusion_input_camera") as tab_fusion_camera:
+                            with gr.Row():
+                                fusion_cam_preset = gr.Dropdown(
+                                    choices=[(f"{c['name']} - {c['short_loc']}", c["url"]) for c in CANTHO_CAMERAS],
+                                    value=CANTHO_CAMERAS[0]["url"],
+                                    label="Chọn Camera",
+                                    interactive=True,
+                                    scale=3
+                                )
+                                btn_fusion_connect_cam = gr.Button("Kết nối", variant="primary", scale=1)
+
+                    with gr.Row():
+                        btn_fusion_run_live = gr.Button("🚀 BẮT ĐẦU DỰ ĐOÁN TÍCH HỢP (2 MODEL)", variant="primary", size="lg")
+                        btn_fusion_stop_live = gr.Button("⏹️ Dừng Lại / Tạm Dừng", variant="stop")
+
+                    fusion_alarm_html = gr.HTML("")
+
+                    fusion_stat_table = gr.DataFrame(
+                        headers=["Chỉ Số Giám Sát", "Giá Trị"],
+                        datatype=["str", "str"],
+                        label="📋 Bảng Chỉ Số Tích Hợp Thủy Văn & Giao Thông (Tuần Tự 2 Model)"
+                    )
+
+                    with gr.Accordion("⚙️ Cài Đặt Ngưỡng Tự Tin 2 Model", open=False):
+                        fusion_flood_conf = gr.Slider(
+                            0.10, 0.90, value=0.25, step=0.05,
+                            label="🌊 Ngưỡng Nhận Diện Nước Ngập (Flood Conf)"
+                        )
+                        fusion_veh_conf = gr.Slider(
+                            0.10, 0.90, value=0.25, step=0.05,
+                            label="🚗 Ngưỡng Phát Hiện Phương Tiện (Vehicle Conf)"
+                        )
+
+                # CỘT BÊN PHẢI: MÀN HÌNH GIÁM SÁT TÍCH HỢP 2 TRONG 1
+                with gr.Column(scale=3):
+                    gr.Markdown("#### 🖼️ 2. Màn Hình Giám Sát Tích Hợp (Mực Nước + Phương Tiện Realtime)")
+                    fusion_canvas = gr.Image(
+                        value=INIT_GAUGE_FRAME,
+                        type="numpy",
+                        show_label=False,
+                        interactive=False,
+                        elem_id="fusion_canvas"
+                    )
+                    fusion_setup_status = gr.HTML(
+                        "<div style='color:#38bdf8;'>💡 <b>Chế độ tích hợp:</b> Hệ thống chạy tuần tự Model 1 (Phân đoạn ngập & Đo độ sâu thủy chuẩn) sau đó đưa frame vào Model 2 (YOLOv8 + ByteTrack) để vẽ đồng thời lớp ngập và phương tiện.</div>",
+                        elem_id="fusion_setup_status"
+                    )
+                    fusion_seek_slider = gr.Slider(
+                        minimum=0,
+                        maximum=100,
+                        value=0,
+                        step=1,
+                        label="Khung hình video",
+                        interactive=True
+                    )
+
+# ==================== SỰ KIỆN CHUNG & TAB 1 (NGẬP LỤT) ====================
         tab5_live_event = btn_tab5_run_live.click(
             fn=run_video_tab5_live,
             inputs=[tab5_click_state, tab5_flood_conf, tab5_seek_slider],
@@ -1889,7 +2424,80 @@ with gr.Blocks(title="AI Urban Flood & Traffic Congestion Monitor", theme=gr.the
             outputs=[traffic_canvas, traffic_stat_table, traffic_alarm_html, traffic_setup_status]
         )
 
-        all_live_events = [tab5_live_event, traffic_live_event]
+        
+        fusion_state = gr.State(DEFAULT_FUSION_STATE.copy())
+
+        fusion_live_event = btn_fusion_run_live.click(
+            fn=run_fusion_live,
+            inputs=[fusion_state, fusion_flood_conf, fusion_veh_conf, fusion_seek_slider],
+            outputs=[fusion_canvas, fusion_stat_table, fusion_alarm_html, fusion_setup_status]
+        )
+
+        all_live_events = [tab5_live_event, traffic_live_event, fusion_live_event]
+
+        btn_fusion_stop_live.click(
+            fn=on_tab5_stop_button,
+            inputs=None,
+            outputs=[fusion_setup_status],
+            cancels=all_live_events
+        )
+
+        tab_item_fusion.select(
+            fn=on_tab5_stop_button,
+            inputs=None,
+            outputs=[fusion_setup_status],
+            cancels=all_live_events
+        )
+
+        tab_fusion_image.select(
+            fn=on_fusion_switch_to_image_tab,
+            inputs=[fusion_upload_image, fusion_state],
+            outputs=[fusion_canvas, fusion_seek_slider, fusion_state, fusion_setup_status],
+            cancels=all_live_events
+        )
+        tab_fusion_video.select(
+            fn=on_fusion_switch_to_video_tab,
+            inputs=[fusion_upload_video, fusion_state],
+            outputs=[fusion_canvas, fusion_seek_slider, fusion_state, fusion_setup_status],
+            cancels=all_live_events
+        )
+        tab_fusion_camera.select(
+            fn=on_fusion_switch_to_camera_tab,
+            inputs=[fusion_cam_preset, fusion_state],
+            outputs=[fusion_canvas, fusion_seek_slider, fusion_state, fusion_setup_status],
+            cancels=all_live_events
+        )
+        fusion_upload_image.change(
+            fn=on_fusion_image_loaded,
+            inputs=[fusion_upload_image, fusion_state],
+            outputs=[fusion_canvas, fusion_seek_slider, fusion_state, fusion_setup_status],
+            cancels=all_live_events
+        )
+        fusion_upload_video.change(
+            fn=on_fusion_video_loaded,
+            inputs=[fusion_upload_video, fusion_state],
+            outputs=[fusion_canvas, fusion_seek_slider, fusion_state, fusion_setup_status],
+            cancels=all_live_events
+        )
+        fusion_cam_preset.change(
+            fn=on_fusion_camera_connect,
+            inputs=[fusion_cam_preset, fusion_state],
+            outputs=[fusion_canvas, fusion_seek_slider, fusion_state, fusion_setup_status],
+            cancels=all_live_events
+        )
+        btn_fusion_connect_cam.click(
+            fn=on_fusion_camera_connect,
+            inputs=[fusion_cam_preset, fusion_state],
+            outputs=[fusion_canvas, fusion_seek_slider, fusion_state, fusion_setup_status],
+            cancels=all_live_events
+        )
+        fusion_seek_slider.release(
+            fn=on_fusion_seek_frame,
+            inputs=[fusion_seek_slider, fusion_state],
+            outputs=[fusion_canvas, fusion_state],
+            cancels=all_live_events
+        )
+
 
         # Nút Dừng ở cả 2 Tab
         btn_tab5_stop_live.click(
